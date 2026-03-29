@@ -1183,7 +1183,7 @@ class TranslatorApp:
         self._stop_event.clear()
         self.last_image_hash = None
         self.btn_toggle.config(
-            text="⏹ 停止监控", bg="#8f2d2d", activebackground="#a83a3a"
+            text="⏹ 停止监控", bg="#b56a00", activebackground="#9a5a00"
         )
         self._set_status("监控中...", "#4ec9b0", "#4ec9b0")
         threading.Thread(target=self._monitor_loop, daemon=True).start()
