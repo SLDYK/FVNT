@@ -10,6 +10,14 @@
       "YOUR_TERM_ID"
     ]
   },
+  "app_settings": {
+    "default_language": "英语 → 中文",
+    "default_interval": 2,
+    "topmost": true,
+    "ocr_font_size": 10,
+    "highlight_foreground": "#ffffff",
+    "highlight_background": "#8a5a00"
+  },
   "custom_dict": [
     "CharacterName",
     "PlaceName",

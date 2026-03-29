@@ -13,11 +13,6 @@ if (-not (Test-Path $pythonPath)) {
     throw "Python executable not found: $pythonPath"
 }
 
-$wordNinjaData = (& $pythonPath -c "import os, wordninja; print(os.path.join(os.path.dirname(wordninja.__file__), 'wordninja', 'wordninja_words.txt.gz'))").Trim()
-if (-not (Test-Path $wordNinjaData)) {
-    throw "wordninja data file not found: $wordNinjaData"
-}
-
 $certifiPem = (& $pythonPath -c "import certifi; print(certifi.where())").Trim()
 if (-not (Test-Path $certifiPem)) {
     throw "certifi certificate bundle not found: $certifiPem"
@@ -40,7 +35,6 @@ $nuitkaArgs = @(
     "--windows-icon-from-ico=T.ico",
     "--output-dir=$resolvedOutputDir",
     "--output-filename=FVNT-Translator.exe",
-    "--include-data-files=$wordNinjaData=wordninja/wordninja_words.txt.gz",
     "--include-data-files=$certifiPem=certifi/cacert.pem",
     "Translation.py"
 )

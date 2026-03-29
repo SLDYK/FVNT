@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import colorchooser, messagebox, simpledialog, ttk
 import requests
 import base64
 import json
@@ -10,7 +10,6 @@ import os
 import threading
 import hashlib
 import pyautogui
-import wordninja
 from embedded_config import get_icon_png_base64
 
 def get_app_dir():
@@ -66,7 +65,31 @@ def save_config(config):
         f.write("\n")
     os.replace(temp_path, CONFIG_PATH)
 
+
+DEFAULT_APP_SETTINGS = {
+    "default_language": "英语 → 中文",
+    "default_interval": 2,
+    "topmost": True,
+    "ocr_font_size": 10,
+    "highlight_foreground": "#ffffff",
+    "highlight_background": "#8a5a00",
+}
+
+
+def get_app_settings(config=None):
+    source = config if config is not None else CONFIG
+    settings = dict(DEFAULT_APP_SETTINGS)
+    raw_settings = source.get("app_settings", {})
+    if isinstance(raw_settings, dict):
+        settings.update(raw_settings)
+    return settings
+
+
+def _is_valid_hex_color(value):
+    return bool(re.fullmatch(r'#[0-9a-fA-F]{6}', str(value).strip()))
+
 CONFIG = load_config()
+CONFIG["app_settings"] = get_app_settings(CONFIG)
 
 # ============ 百度 Access Token 获取 ============
 def get_access_token(api_key, secret_key):
@@ -133,6 +156,7 @@ def _needs_space_between(left, right):
 _CJK_RE = re.compile(
     r'[\u2E80-\u9FFF\uF900-\uFAFF\U00020000-\U0002FA1F]'
 )
+_DICT_NORMALIZE_SKIP_CHARS = {'-', '‐', '‑', '‒', '–', '—', '―'}
 
 class CustomDictionaryState:
     def __init__(self):
@@ -227,131 +251,221 @@ def clean_ocr_text(text):
     """
     修复 OCR 常见的空格问题：
     1. CJK 字符之间的错误空格 → 移除
-    2. 拉丁字母被拆散 (如 "H e l l o") → 合并后用 wordninja 重新分词
-    3. 拉丁单词被粘连 (如 "HelloWorld") → 用 wordninja 拆分
+    2. 拉丁文本不再执行去空白和自动分词
+    3. 仅保留基于自定义词典的匹配修正
     """
+    cleaned_text, _ = clean_ocr_text_with_debug(text)
+    return cleaned_text
+
+
+def clean_ocr_text_with_debug(text):
     CUSTOM_DICT_STATE.refresh()
+    debug_steps = [
+        ("输入文本", text),
+        (
+            "当前自定义词典",
+            "、".join(CONFIG.get("custom_dict", [])) or "(空)"
+        )
+    ]
     normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
-    normalized_text = normalized_text.replace("\n", " ")
-    return _clean_line(normalized_text)
+    debug_steps.append(("统一换行符", normalized_text))
+    flattened_text = normalized_text.replace("\n", " ")
+    debug_steps.append(("换行转空格", flattened_text))
+    cleaned_text, clean_line_steps = _clean_line_with_debug(flattened_text)
+    debug_steps.extend(clean_line_steps)
+    return cleaned_text, _format_debug_steps(debug_steps)
 
 def _clean_line(line):
+    cleaned_line, _ = _clean_line_with_debug(line)
+    return cleaned_line
+
+
+def _clean_line_with_debug(line):
     # 第1步: 移除 CJK 字符之间的空格
-    line = re.sub(
+    cjk_space_cleaned = re.sub(
         r'(?<=[\u2E80-\u9FFF\uF900-\uFAFF])\s+(?=[\u2E80-\u9FFF\uF900-\uFAFF])',
         '', line
     )
+    debug_steps = [("移除 CJK 字符之间的空格", cjk_space_cleaned)]
 
     # 第2步: 按 CJK / 非CJK 分段处理
-    segments = re.split(r'([\u2E80-\u9FFF\uF900-\uFAFF]+)', line)
+    segments = re.split(r'([\u2E80-\u9FFF\uF900-\uFAFF]+)', cjk_space_cleaned)
+    debug_steps.append(("CJK / 非 CJK 分段", _format_segments_for_debug(segments)))
     result_parts = []
+    segment_debug_entries = []
     for seg in segments:
         if not seg:
             continue
         if _CJK_RE.search(seg):
             # CJK 段落，直接保留（空格已在第1步清除）
             result_parts.append(seg)
+            segment_debug_entries.append(
+                "CJK 片段直接保留\n" + _indent_debug_block(repr(seg))
+            )
         else:
             # 拉丁/数字段落，修复空格问题
-            result_parts.append(_fix_latin_segment(seg))
-    return ''.join(result_parts)
+            fixed_segment, latin_debug = _fix_latin_segment_with_debug(seg)
+            result_parts.append(fixed_segment)
+            segment_debug_entries.append(
+                "非 CJK 片段处理\n" + _indent_debug_block(latin_debug)
+            )
+    cleaned_line = ''.join(result_parts)
+    debug_steps.append((
+        "各分段处理明细",
+        "\n\n".join(segment_debug_entries) if segment_debug_entries else "(无)"
+    ))
+    debug_steps.append(("最终清洗结果", cleaned_line))
+    return cleaned_line, debug_steps
 
 def _fix_latin_segment(seg):
-    """修复拉丁文段落：先去空白，再以 wordninja 为底稿合并自定义词典结果。"""
-    normalized_seg = _remove_latin_whitespace(seg)
-    if not normalized_seg:
-        return ' '  # 保留 CJK 与拉丁之间的间隔
+    fixed_segment, _ = _fix_latin_segment_with_debug(seg)
+    return fixed_segment
 
-    parts = re.findall(r'[a-zA-Z]+|[^a-zA-Z]+', normalized_seg)
-    result = []
-    for i, part in enumerate(parts):
-        if part[0].isalpha():
-            result.append(_tokenize_latin_segment(part))
-        else:
-            # 非字母部分(数字/标点)：仅在数字左右加空格，标点不加
-            piece = part
-            has_digit = any(c.isdigit() for c in part)
-            if has_digit:
-                if result and result[-1] and result[-1][-1].isalpha():
-                    piece = ' ' + piece
-                if i + 1 < len(parts) and parts[i + 1][0].isalpha():
-                    piece = piece + ' '
-            result.append(piece)
-    return ''.join(result)
 
-def _remove_latin_whitespace(text):
-    return re.sub(r'\s+', '', text)
+def _fix_latin_segment_with_debug(seg):
+    """修复拉丁文段落：保留原始空白，仅执行自定义词典匹配修正。"""
+    debug_lines = [
+        f"原始片段: {seg!r}"
+    ]
+    fixed_segment, match_details = _apply_custom_dictionary_to_segment(seg)
+    debug_lines.append(f"自定义词典命中: {match_details}")
+    debug_lines.append(f"输出: {fixed_segment!r}")
+    return fixed_segment, '\n'.join(debug_lines)
 
-def _tokenize_latin_segment(text):
-    base_tokens = _split_latin_tokens_with_spans(text)
-    custom_spans = _find_custom_dict_spans(text)
-    if not custom_spans:
-        return ' '.join(token for _, _, token in base_tokens if token)
-    merged_tokens = _merge_latin_tokens(text, base_tokens, custom_spans)
-    return ' '.join(token for token in merged_tokens if token)
+def _normalize_dict_lookup_text(text):
+    normalized_chars = []
+    index_map = []
+    for index, char in enumerate(text):
+        if char.isspace() or char in _DICT_NORMALIZE_SKIP_CHARS:
+            continue
+        normalized_chars.append(char)
+        index_map.append(index)
+    return ''.join(normalized_chars), index_map
 
-def _split_latin_tokens_with_spans(text):
-    if not text:
-        return []
+def _is_hyphen_prefixed_word(text):
+    stripped = str(text).strip()
+    return bool(stripped) and stripped[0] in _DICT_NORMALIZE_SKIP_CHARS
 
-    tokens = []
-    start = 0
-    camel_boundaries = list(re.finditer(r'(?<=[a-z])(?=[A-Z])', text))
-    for boundary in camel_boundaries:
-        end = boundary.start()
-        tokens.extend(_split_wordninja_chunk(text, start, end))
-        start = end
-    tokens.extend(_split_wordninja_chunk(text, start, len(text)))
-    return tokens
+def _is_valid_hyphen_custom_match(text, start, end, allow_prefix_start=False):
+    if start < 0 or end > len(text) or start >= end:
+        return False
 
-def _split_wordninja_chunk(text, start, end):
-    chunk = text[start:end]
-    if not chunk:
-        return []
+    left_char = text[start - 1] if start > 0 else ''
+    right_char = text[end] if end < len(text) else ''
 
-    split_words = wordninja.split(chunk)
-    if not split_words:
-        return [(start, end, chunk)]
+    left_ok = not left_char or (not left_char.isalpha())
+    right_ok = (
+        not right_char or
+        (not right_char.isalpha()) or
+        (allow_prefix_start and start == 0)
+    )
+    return left_ok and right_ok
 
-    joined = ''.join(split_words)
-    if joined.casefold() != chunk.casefold():
-        return [(start, end, chunk)]
 
-    tokens = []
+def _expand_hyphen_prefixed_match_start(text, start):
     cursor = start
-    for word in split_words:
-        piece = text[cursor:cursor + len(word)]
-        if piece.casefold() != word.casefold():
-            return [(start, end, chunk)]
-        tokens.append((cursor, cursor + len(word), piece))
-        cursor += len(word)
+    while cursor > 0 and text[cursor - 1].isspace():
+        cursor -= 1
+    if cursor > 0 and text[cursor - 1] in _DICT_NORMALIZE_SKIP_CHARS:
+        return cursor - 1
+    return start
 
-    if cursor != end:
-        return [(start, end, chunk)]
-    return tokens
 
-def _find_custom_dict_spans(text):
+def _needs_space_between_segments(left_text, right_text):
+    if not left_text or not right_text:
+        return False
+    if left_text[-1].isspace() or right_text[0].isspace():
+        return False
+    return True
+
+def _apply_custom_dictionary_to_segment(text):
+    matches = _find_custom_dict_matches(text)
+    if not matches:
+        return text, "(无)"
+
+    result_parts = []
+    match_details = []
+    cursor = 0
+    for start, end, replacement in matches:
+        original_text = text[start:end]
+        prefix = text[cursor:start]
+        if prefix:
+            result_parts.append(prefix)
+
+        adjusted_replacement = replacement
+        if _needs_space_between_segments(''.join(result_parts), adjusted_replacement):
+            adjusted_replacement = ' ' + adjusted_replacement
+
+        suffix = text[end:]
+        if _needs_space_between_segments(adjusted_replacement, suffix):
+            adjusted_replacement = adjusted_replacement + ' '
+
+        result_parts.append(adjusted_replacement)
+        if adjusted_replacement == original_text:
+            match_details.append(
+                f"{original_text!r} 命中词典，但无需改写"
+            )
+        else:
+            match_details.append(
+                f"{original_text!r} -> {adjusted_replacement!r}"
+            )
+        cursor = end
+
+    if cursor < len(text):
+        result_parts.append(text[cursor:])
+
+    return ''.join(result_parts), '\n'.join(match_details)
+
+
+def _format_debug_steps(steps):
+    lines = []
+    for index, (title, value) in enumerate(steps, start=1):
+        display_value = value if value else "(空)"
+        lines.append(f"步骤 {index}: {title}")
+        lines.append(display_value)
+        lines.append("")
+    return '\n'.join(lines).rstrip()
+
+
+def _format_segments_for_debug(segments):
+    formatted = []
+    for index, segment in enumerate(seg for seg in segments if seg):
+        segment_type = "CJK" if _CJK_RE.search(segment) else "非 CJK"
+        formatted.append(f"[{index}] {segment_type}: {segment!r}")
+    return '\n'.join(formatted) if formatted else "(无)"
+
+
+def _indent_debug_block(text, prefix='    '):
+    return '\n'.join(prefix + line for line in text.splitlines())
+
+
+def _find_custom_dict_matches(text, allow_hyphen_prefix_start=False):
     words = [item for item in CONFIG.get('custom_dict', []) if str(item).strip()]
     if not words or not text:
+        return []
+
+    normalized_text, normalized_index_map = _normalize_dict_lookup_text(text)
+    if not normalized_text:
         return []
 
     normalized_words = []
     seen = set()
     for word in words:
-        normalized = _remove_latin_whitespace(str(word))
+        raw_word = str(word).strip()
+        normalized, _ = _normalize_dict_lookup_text(raw_word)
         if not normalized:
             continue
-        key = normalized.casefold()
+        key = (normalized.casefold(), _is_hyphen_prefixed_word(raw_word))
         if key in seen:
             continue
         seen.add(key)
-        normalized_words.append(normalized)
+        normalized_words.append((normalized, raw_word, _is_hyphen_prefixed_word(raw_word)))
 
-    normalized_words.sort(key=len, reverse=True)
-    folded_text = text.casefold()
-    occupied = [False] * len(text)
-    spans = []
-    for word in normalized_words:
+    normalized_words.sort(key=lambda item: len(item[0]), reverse=True)
+    folded_text = normalized_text.casefold()
+    occupied = [False] * len(normalized_text)
+    matches = []
+    for word, raw_word, is_hyphen_prefixed in normalized_words:
         folded_word = word.casefold()
         start = 0
         while True:
@@ -360,49 +474,33 @@ def _find_custom_dict_spans(text):
                 break
             end = index + len(word)
             if not any(occupied[index:end]):
-                spans.append((index, end))
-                for pos in range(index, end):
-                    occupied[pos] = True
+                original_start = normalized_index_map[index]
+                original_end = normalized_index_map[end - 1] + 1
+                if (not is_hyphen_prefixed or
+                        _is_valid_hyphen_custom_match(
+                            text,
+                            original_start,
+                            original_end,
+                            allow_prefix_start=allow_hyphen_prefix_start
+                        )):
+                    if is_hyphen_prefixed:
+                        original_start = _expand_hyphen_prefixed_match_start(
+                            text,
+                            original_start
+                        )
+                    matches.append((original_start, original_end, raw_word))
+                    for pos in range(index, end):
+                        occupied[pos] = True
             start = index + 1
 
-    spans.sort()
-    return spans
+    matches.sort(key=lambda item: item[0])
+    return matches
 
-def _merge_latin_tokens(text, base_tokens, custom_spans):
-    merged = []
-    cursor = 0
-    span_index = 0
-    token_index = 0
-
-    while cursor < len(text):
-        while span_index < len(custom_spans) and custom_spans[span_index][1] <= cursor:
-            span_index += 1
-        while token_index < len(base_tokens) and base_tokens[token_index][1] <= cursor:
-            token_index += 1
-
-        if span_index < len(custom_spans) and custom_spans[span_index][0] == cursor:
-            start, end = custom_spans[span_index]
-            merged.append(text[start:end])
-            cursor = end
-            span_index += 1
-            continue
-
-        if token_index >= len(base_tokens):
-            merged.append(text[cursor:])
-            break
-
-        _, token_end, _ = base_tokens[token_index]
-        next_cut = token_end
-        if span_index < len(custom_spans):
-            next_cut = min(next_cut, custom_spans[span_index][0])
-
-        if next_cut <= cursor:
-            next_cut = token_end
-
-        merged.append(text[cursor:next_cut])
-        cursor = next_cut
-
-    return merged
+def _find_custom_dict_spans(text, allow_hyphen_prefix_start=False):
+    return [(start, end) for start, end, _ in _find_custom_dict_matches(
+        text,
+        allow_hyphen_prefix_start=allow_hyphen_prefix_start
+    )]
 
 # ============ 百度翻译 ============
 def translate_text(text, from_lang="auto", to_lang="zh"):
@@ -595,22 +693,20 @@ class TranslatorApp:
 
     LANG_OPTIONS = {
         "英语 → 中文":    ("en",   "zh"),
-        "日语 → 中文":    ("jp",   "zh"),
-        "韩语 → 中文":    ("kor",  "zh"),
         "中文 → 英语":    ("zh",   "en"),
-        "自动检测 → 中文": ("auto", "zh"),
     }
 
-    MIN_WIDTH  = 420
+    MIN_WIDTH  = 380
     MIN_HEIGHT = 300
 
     def __init__(self):
+        self.app_settings = get_app_settings(CONFIG)
         self.root = tk.Tk()
         self.root.withdraw()
         apply_window_icon(self.root)
         self.root.title("1615's Translator")
-        self.root.attributes("-topmost", True)
-        self.root.geometry("800x500+150+150")
+        self.root.attributes("-topmost", bool(self.app_settings["topmost"]))
+        self.root.geometry("600x450+150+150")
         self.root.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.root.configure(bg="#2b2b2b")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -620,9 +716,13 @@ class TranslatorApp:
         self._stop_event      = threading.Event()
         self.last_image_hash  = None
         self.last_ocr_text    = ""
-        self.interval_var     = tk.IntVar(value=2)
-        self.lang_var         = tk.StringVar(value="日语 → 中文")
-        self.topmost_var      = tk.BooleanVar(value=True)
+        default_language = self.app_settings["default_language"]
+        if default_language not in self.LANG_OPTIONS:
+            default_language = "英语 → 中文"
+        self.interval_var     = tk.IntVar(value=int(self.app_settings["default_interval"]))
+        self.lang_var         = tk.StringVar(value=default_language)
+        self.topmost_var      = tk.BooleanVar(value=bool(self.app_settings["topmost"]))
+        self._settings_win    = None
 
         self._drag = {"x": 0, "y": 0}
         self._build_ui()
@@ -669,38 +769,47 @@ class TranslatorApp:
         row1 = tk.Frame(ctrl, bg="#2b2b2b")
         row1.pack(fill=tk.X)
 
+        for column in range(3):
+            row1.grid_columnconfigure(column, weight=1, uniform="main_actions")
+
         self.btn_select = tk.Button(
-            row1, text="📷 选择区域", bg="#0e639c", fg="white",
+            row1, text="📷 选择区域", bg="#8f2d2d", fg="white",
             font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
-            activebackground="#1177aa", command=self._select_region
+            activebackground="#a83a3a", command=self._select_region
         )
-        self.btn_select.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_select.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
 
         self.btn_toggle = tk.Button(
-            row1, text="▶ 开始监控", bg="#4a9d4a", fg="white",
+            row1, text="▶ 开始监控", bg="#9a5a00", fg="white",
             font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
-            activebackground="#5ab65a", command=self._toggle_monitor
+            activebackground="#b56a00", command=self._toggle_monitor
         )
-        self.btn_toggle.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_toggle.grid(row=0, column=1, sticky="ew", padx=3, pady=(0, 6))
 
         tk.Button(
-            row1, text="🔍 立即翻译", bg="#7c5c9e", fg="white",
+            row1, text="🔍 立即翻译", bg="#8b7a00", fg="white",
             font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
-            activebackground="#9470b8", command=self._translate_once
-        ).pack(side=tk.LEFT, padx=(0, 6))
+            activebackground="#a09100", command=self._translate_once
+        ).grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=(0, 6))
 
         tk.Button(
-            row1, text="➕ 添加词典", bg="#8a6a32", fg="white",
+            row1, text="➕ 添加词典", bg="#0b7285", fg="white",
             font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
-            activebackground="#a07f42", command=self._add_custom_word
-        ).pack(side=tk.LEFT, padx=(0, 6))
+            activebackground="#1493a5", command=self._add_custom_word
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 0))
 
         tk.Button(
-            row1, text="📋 显示译文", bg="#4a6e8a", fg="white",
+            row1, text="📋 显示译文", bg="#2f5aa8", fg="white",
             font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
-            activebackground="#5a82a0",
+            activebackground="#3b6cc4",
             command=lambda: self.float_win.show()
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=1, sticky="ew", padx=3, pady=(0, 0))
+
+        tk.Button(
+            row1, text="⚙ 其他设置", bg="#5b3f8c", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
+            activebackground="#7250b3", command=self._open_settings
+        ).grid(row=1, column=2, sticky="ew", padx=(6, 0), pady=(0, 0))
 
         # 行2：语言 + 间隔
         row2 = tk.Frame(ctrl, bg="#2b2b2b", pady=4)
@@ -754,7 +863,7 @@ class TranslatorApp:
 
         tk.Frame(self.root, bg="#444444", height=1).pack(fill=tk.X)
 
-        # 文本区域（仅显示识别原文）
+        # 文本区域（显示清洗后的识别原文）
         content = tk.Frame(self.root, bg="#2b2b2b")
         content.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 6))
 
@@ -763,8 +872,14 @@ class TranslatorApp:
 
         self.ocr_box = tk.Text(
             content, wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4",
-            font=("Microsoft YaHei UI", 10), relief=tk.FLAT,
+            font=("Microsoft YaHei UI", int(self.app_settings["ocr_font_size"])), relief=tk.FLAT,
             height=4, padx=6, pady=4, state=tk.DISABLED
+        )
+        self.ocr_box.tag_configure(
+            "custom_dict_hit",
+            foreground=self.app_settings["highlight_foreground"],
+            background=self.app_settings["highlight_background"],
+            font=("Microsoft YaHei UI", int(self.app_settings["ocr_font_size"]), "bold")
         )
         self.ocr_box.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
@@ -799,6 +914,240 @@ class TranslatorApp:
         h  = max(self.MIN_HEIGHT, self._resize_data["h"] + dy)
         self.root.geometry(f"{w}x{h}")
 
+    def _choose_color(self, variable, parent_window):
+        color = colorchooser.askcolor(color=variable.get(), parent=parent_window)[1]
+        if color:
+            variable.set(color)
+
+    def _apply_app_settings(self, settings):
+        self.app_settings = dict(settings)
+        default_language = settings["default_language"]
+        if default_language not in self.LANG_OPTIONS:
+            default_language = "英语 → 中文"
+        self.lang_var.set(default_language)
+        self.interval_var.set(int(settings["default_interval"]))
+        self.topmost_var.set(bool(settings["topmost"]))
+        self.root.attributes("-topmost", self.topmost_var.get())
+
+        font_size = int(settings["ocr_font_size"])
+        self.ocr_box.configure(font=("Microsoft YaHei UI", font_size))
+        self.ocr_box.tag_configure(
+            "custom_dict_hit",
+            foreground=settings["highlight_foreground"],
+            background=settings["highlight_background"],
+            font=("Microsoft YaHei UI", font_size, "bold")
+        )
+        if self.last_ocr_text:
+            self._update_ocr_text(self.last_ocr_text)
+
+    def _open_settings(self):
+        if self._settings_win and self._settings_win.winfo_exists():
+            self._settings_win.deiconify()
+            self._settings_win.lift()
+            self._settings_win.focus_force()
+            return
+
+        settings = get_app_settings(CONFIG)
+        win = tk.Toplevel(self.root)
+        self._settings_win = win
+        apply_window_icon(win)
+        win.title("其他设置")
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+        win.configure(bg="#2b2b2b")
+        win.geometry("560x460+220+180")
+
+        language_var = tk.StringVar(value=settings["default_language"])
+        interval_var = tk.IntVar(value=int(settings["default_interval"]))
+        topmost_var = tk.BooleanVar(value=bool(settings["topmost"]))
+        font_size_var = tk.IntVar(value=int(settings["ocr_font_size"]))
+        highlight_fg_var = tk.StringVar(value=settings["highlight_foreground"])
+        highlight_bg_var = tk.StringVar(value=settings["highlight_background"])
+        new_word_var = tk.StringVar()
+
+        notebook = ttk.Notebook(win)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 8))
+
+        general_tab = tk.Frame(notebook, bg="#2b2b2b")
+        dictionary_tab = tk.Frame(notebook, bg="#2b2b2b")
+        display_tab = tk.Frame(notebook, bg="#2b2b2b")
+        notebook.add(general_tab, text="常规")
+        notebook.add(dictionary_tab, text="词典")
+        notebook.add(display_tab, text="界面")
+
+        tk.Label(general_tab, text="默认语言", fg="#9cdcfe", bg="#2b2b2b",
+                 font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 6))
+        general_language_menu = tk.OptionMenu(general_tab, language_var, *self.LANG_OPTIONS.keys())
+        general_language_menu.config(bg="#3c3c3c", fg="white", activebackground="#505050",
+                                     font=("Microsoft YaHei UI", 9), bd=0, highlightthickness=0)
+        general_language_menu["menu"].config(bg="#3c3c3c", fg="white",
+                                              font=("Microsoft YaHei UI", 9))
+        general_language_menu.grid(row=0, column=1, sticky="w", padx=12, pady=(14, 6))
+
+        tk.Label(general_tab, text="默认监控间隔（秒）", fg="#9cdcfe", bg="#2b2b2b",
+                 font=("Microsoft YaHei UI", 9)).grid(row=1, column=0, sticky="w", padx=12, pady=6)
+        tk.Spinbox(general_tab, from_=1, to=10, textvariable=interval_var, width=8,
+                   font=("Microsoft YaHei UI", 9)).grid(row=1, column=1, sticky="w", padx=12, pady=6)
+
+        tk.Checkbutton(
+            general_tab, text="启动时窗口置顶", variable=topmost_var,
+            fg="white", bg="#2b2b2b", selectcolor="#333333",
+            activebackground="#2b2b2b", activeforeground="white",
+            font=("Microsoft YaHei UI", 9)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=6)
+
+        dictionary_list = tk.Listbox(
+            dictionary_tab, bg="#1e1e1e", fg="#d4d4d4",
+            font=("Consolas", 10), selectbackground="#264f78",
+            relief=tk.FLAT, height=14
+        )
+        dictionary_list.pack(fill=tk.BOTH, expand=True, padx=12, pady=(14, 8))
+        for word in CONFIG.get("custom_dict", []):
+            dictionary_list.insert(tk.END, word)
+
+        dictionary_actions = tk.Frame(dictionary_tab, bg="#2b2b2b")
+        dictionary_actions.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Entry(
+            dictionary_actions, textvariable=new_word_var,
+            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+            relief=tk.FLAT, font=("Microsoft YaHei UI", 9)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def add_dictionary_word():
+            word = new_word_var.get().strip()
+            if not word:
+                messagebox.showwarning("提示", "自定义词不能为空", parent=win)
+                return
+            existing = {
+                dictionary_list.get(index).casefold()
+                for index in range(dictionary_list.size())
+            }
+            if word.casefold() in existing:
+                messagebox.showinfo("提示", f"“{word}” 已存在", parent=win)
+                return
+            dictionary_list.insert(tk.END, word)
+            new_word_var.set("")
+
+        def remove_dictionary_word():
+            selected = list(dictionary_list.curselection())
+            if not selected:
+                messagebox.showwarning("提示", "请先选择要删除的词", parent=win)
+                return
+            for index in reversed(selected):
+                dictionary_list.delete(index)
+
+        tk.Button(
+            dictionary_actions, text="添加", bg="#0e639c", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
+            activebackground="#1177aa", command=add_dictionary_word
+        ).pack(side=tk.LEFT, padx=(8, 6))
+        tk.Button(
+            dictionary_actions, text="删除选中", bg="#9d4a4a", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
+            activebackground="#b05a5a", command=remove_dictionary_word
+        ).pack(side=tk.LEFT)
+
+        tk.Label(display_tab, text="识别原文字号", fg="#9cdcfe", bg="#2b2b2b",
+                 font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 6))
+        tk.Spinbox(display_tab, from_=8, to=20, textvariable=font_size_var, width=8,
+                   font=("Microsoft YaHei UI", 9)).grid(row=0, column=1, sticky="w", padx=12, pady=(14, 6))
+
+        tk.Label(display_tab, text="命中高亮文字颜色", fg="#9cdcfe", bg="#2b2b2b",
+                 font=("Microsoft YaHei UI", 9)).grid(row=1, column=0, sticky="w", padx=12, pady=6)
+        tk.Entry(display_tab, textvariable=highlight_fg_var, width=12,
+                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+                 relief=tk.FLAT, font=("Consolas", 10)).grid(row=1, column=1, sticky="w", padx=(12, 6), pady=6)
+        tk.Button(
+            display_tab, text="选择", bg="#3c3c3c", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
+            activebackground="#505050",
+            command=lambda: self._choose_color(highlight_fg_var, win)
+        ).grid(row=1, column=2, sticky="w", padx=6, pady=6)
+
+        tk.Label(display_tab, text="命中高亮背景颜色", fg="#9cdcfe", bg="#2b2b2b",
+                 font=("Microsoft YaHei UI", 9)).grid(row=2, column=0, sticky="w", padx=12, pady=6)
+        tk.Entry(display_tab, textvariable=highlight_bg_var, width=12,
+                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+                 relief=tk.FLAT, font=("Consolas", 10)).grid(row=2, column=1, sticky="w", padx=(12, 6), pady=6)
+        tk.Button(
+            display_tab, text="选择", bg="#3c3c3c", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=10, pady=4,
+            activebackground="#505050",
+            command=lambda: self._choose_color(highlight_bg_var, win)
+        ).grid(row=2, column=2, sticky="w", padx=6, pady=6)
+
+        bottom_bar = tk.Frame(win, bg="#2b2b2b")
+        bottom_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def save_settings():
+            language = language_var.get()
+            if language not in self.LANG_OPTIONS:
+                messagebox.showerror("错误", "默认语言选项无效", parent=win)
+                return
+
+            try:
+                interval = int(interval_var.get())
+                font_size = int(font_size_var.get())
+            except (TypeError, ValueError):
+                messagebox.showerror("错误", "间隔和字号必须是整数", parent=win)
+                return
+
+            if interval < 1 or interval > 10:
+                messagebox.showerror("错误", "默认监控间隔必须在 1 到 10 秒之间", parent=win)
+                return
+            if font_size < 8 or font_size > 20:
+                messagebox.showerror("错误", "识别原文字号必须在 8 到 20 之间", parent=win)
+                return
+
+            highlight_fg = highlight_fg_var.get().strip()
+            highlight_bg = highlight_bg_var.get().strip()
+            if not _is_valid_hex_color(highlight_fg) or not _is_valid_hex_color(highlight_bg):
+                messagebox.showerror("错误", "高亮颜色必须是 #RRGGBB 格式", parent=win)
+                return
+
+            updated_words = [
+                dictionary_list.get(index)
+                for index in range(dictionary_list.size())
+            ]
+            updated_config = load_config()
+            updated_config["custom_dict"] = updated_words
+            updated_config["app_settings"] = {
+                "default_language": language,
+                "default_interval": interval,
+                "topmost": bool(topmost_var.get()),
+                "ocr_font_size": font_size,
+                "highlight_foreground": highlight_fg,
+                "highlight_background": highlight_bg,
+            }
+            save_config(updated_config)
+
+            CONFIG.clear()
+            CONFIG.update(updated_config)
+            CONFIG["app_settings"] = get_app_settings(CONFIG)
+            CUSTOM_DICT_STATE.refresh(force=True)
+            self._apply_app_settings(CONFIG["app_settings"])
+            self._set_status("设置已保存", "#9cdcfe", "#4ec9b0")
+            self._settings_win = None
+            win.destroy()
+
+        def on_close_settings():
+            self._settings_win = None
+            win.destroy()
+
+        tk.Button(
+            bottom_bar, text="保存", bg="#4a9d4a", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=14, pady=5,
+            activebackground="#5ab65a", command=save_settings
+        ).pack(side=tk.RIGHT)
+        tk.Button(
+            bottom_bar, text="取消", bg="#3c3c3c", fg="white",
+            font=("Microsoft YaHei UI", 9), bd=0, padx=14, pady=5,
+            activebackground="#505050", command=on_close_settings
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        win.protocol("WM_DELETE_WINDOW", on_close_settings)
+        win.focus_force()
+
     # ----------------------------------------------------- 区域选择 --
     def _select_region(self):
         self.root.withdraw()
@@ -813,6 +1162,7 @@ class TranslatorApp:
             )
             self.last_image_hash = None
             self.last_ocr_text   = ""
+            self._update_ocr_text("")
             self._set_status("区域已选择，点击开始监控", "#9cdcfe", "#4a9d4a")
             self.root.deiconify()
 
@@ -833,7 +1183,7 @@ class TranslatorApp:
         self._stop_event.clear()
         self.last_image_hash = None
         self.btn_toggle.config(
-            text="⏹ 停止监控", bg="#9d4a4a", activebackground="#b05a5a"
+            text="⏹ 停止监控", bg="#8f2d2d", activebackground="#a83a3a"
         )
         self._set_status("监控中...", "#4ec9b0", "#4ec9b0")
         threading.Thread(target=self._monitor_loop, daemon=True).start()
@@ -842,7 +1192,7 @@ class TranslatorApp:
         self.is_monitoring = False
         self._stop_event.set()
         self.btn_toggle.config(
-            text="▶ 开始监控", bg="#4a9d4a", activebackground="#5ab65a"
+            text="▶ 开始监控", bg="#9a5a00", activebackground="#b56a00"
         )
         self._set_status("已停止监控", "#999999", "#666666")
 
@@ -872,6 +1222,7 @@ class TranslatorApp:
         self.root.after(0, self._set_status, "识别中...", "#dcdcaa", "#dcdcaa")
         raw_text = ocr_recognize(image_bytes)
         if not raw_text.strip():
+            self.root.after(0, self._update_ocr_text, "")
             self.root.after(0, self._set_status,
                             "未识别到文字，监控中...", "#999999", "#4ec9b0")
             return
@@ -909,11 +1260,12 @@ class TranslatorApp:
 
                 raw_text = ocr_recognize(image_bytes)
                 if not raw_text.strip():
+                    self.root.after(0, self._update_ocr_text, "")
                     self.root.after(0, self._set_status,
                                     "未识别到文字", "#999999", "#666666")
                     return
 
-                ocr_text   = clean_ocr_text(raw_text)
+                ocr_text = clean_ocr_text(raw_text)
                 self.root.after(0, self._update_ocr_text, ocr_text)
                 from_lang, to_lang = self.LANG_OPTIONS[self.lang_var.get()]
                 translated = translate_text(ocr_text,
@@ -963,9 +1315,18 @@ class TranslatorApp:
 
     # ----------------------------------------------------- UI 更新辅助 --
     def _update_ocr_text(self, ocr_text):
+        custom_spans = _find_custom_dict_spans(ocr_text)
+
         self.ocr_box.configure(state=tk.NORMAL)
         self.ocr_box.delete("1.0", tk.END)
         self.ocr_box.insert(tk.END, ocr_text)
+        self.ocr_box.tag_remove("custom_dict_hit", "1.0", tk.END)
+        for start, end in custom_spans:
+            self.ocr_box.tag_add(
+                "custom_dict_hit",
+                f"1.0 + {start} chars",
+                f"1.0 + {end} chars"
+            )
         self.ocr_box.configure(state=tk.DISABLED)
 
     def _update_translation_text(self, translated):
