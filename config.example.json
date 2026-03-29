@@ -1,0 +1,25 @@
+{
+  "baidu_ocr": {
+    "api_key": "YOUR_BAIDU_OCR_API_KEY",
+    "secret_key": "YOUR_BAIDU_OCR_SECRET_KEY"
+  },
+  "baidu_translate": {
+    "api_key": "YOUR_BAIDU_TRANSLATE_API_KEY",
+    "secret_key": "YOUR_BAIDU_TRANSLATE_SECRET_KEY",
+    "term_ids": [
+      "YOUR_TERM_ID"
+    ]
+  },
+  "custom_dict": [
+    "CharacterName",
+    "PlaceName",
+    "SkillName",
+    "GuildMaster",
+    "QuestBoard",
+    "AutoSave",
+    "QuickLoad",
+    "DialogueBox",
+    "cutscene",
+    "subtitle"
+  ]
+}

@@ -1,0 +1,5 @@
+requests>=2.32.0
+pyautogui>=0.9.54
+wordninja>=2.0.0
+certifi>=2024.0.0
+nuitka>=2.0.0
